@@ -1,3 +1,6 @@
+#include "Arduino.h"
+#include "LowLevel.h"
+#include "OneWireSlave.h"
 #include <EEPROM.h>
 //#define SERIAL_TRACE // Comment to disable trace to serial port
 
@@ -13,6 +16,10 @@
 #define PIN_DIGITAL_INPUT 0x08 // Pin is digital input
 #define PIN_DIGITAL_INPUT_PULLUP 0x04 // Enable internal Pull-up resistor (digital input)
 
+// for nano,
+// PWM: 3, 5, 6, 9, 10, and 11
+
+
 #include <avr/wdt.h>
 #ifndef _SOFT_RESTART_H
 #define _SOFT_RESTART_H
@@ -25,6 +32,32 @@ do \
 } while(0)
 #endif
 
+// setup pin 2 as 1-wire (requires interrupts)
+Pin oneWireData(2);
+// storage for our 1-wire address
+byte owROM[7] = { 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+const byte default_owROM[7] = { 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+// This sample emulates a DS18B20 device (temperature sensor), so we start by defining the available commands
+const byte DS18B20_START_CONVERSION = 0x44;
+const byte DS18B20_READ_SCRATCHPAD = 0xBE;
+const byte DS18B20_WRITE_SCRATCHPAD = 0x4E;
+enum DeviceState
+{
+  DS_WaitingReset,
+  DS_WaitingCommand,
+  DS_ConvertingTemperature,
+  DS_TemperatureConverted,
+  DS_WaitingData,
+};
+volatile DeviceState state = DS_WaitingReset;
+
+// scratchpad, with the CRC byte at the end
+volatile byte scratchpad[20] = "scratchpad";
+volatile byte scratchposn = 0;
+volatile byte scratchpadin[20];
+volatile byte scratchinposn = 0;
+
+
 // Function Pototype
 void wdt_init(void) __attribute__((naked)) __attribute__((section(".init3")));
 
@@ -36,8 +69,8 @@ void wdt_init(void)
  	return;
 }
 
-const char FIRMWARE_VERSION[] = "1.0.0";
-const char FIRMWARE_NAME[] = "GenericPin";
+char *FIRMWARE_VERSION = "1.0.0";
+char *FIRMWARE_NAME = "GenericPin1Wire";
 
 // these values are saved in EEPROM
 const byte EEPROM_ID1 = 'G'; // used to identify if valid data in EEPROM
@@ -65,17 +98,19 @@ const int PWM_PINS_SIZE = (sizeof(PWM_PINS) / sizeof(int));
 const int STATE_ANALOG_ADDR = STATE_DIGITAL_ADDR_END; // state of PWM pins, 
 const int STATE_ANALOG_ADDR_END = STATE_ANALOG_ADDR + DIGITAL_PINS; // state of PWM pins, 
 
+
 const int MAX_COMMAND_LEN = 200;
 
 byte digitalConfig[DIGITAL_PINS];
 int digitalState[DIGITAL_PINS];
+
 
 class CommandBuffer {
 public:
 	CommandBuffer() : p(0), ready(false) {
 	}
 	boolean append(char c) {
-		if(c == '\n') {
+		if((c == '\n') || (c == '\r')) {
 			ready = true;
 		} else if(p < MAX_COMMAND_LEN) {
 			buffer[p++] = c;
@@ -84,6 +119,27 @@ public:
 		}
 		return ready;
 	}
+
+	boolean append(char *str) {
+    int l = strlen(str);
+    for (int i = 0; i < l; i++){
+      char c = str[i];
+      if(p < MAX_COMMAND_LEN-1) {
+        buffer[p++] = c;
+        if (c < 0x20)
+          ready = true;
+      }      
+    }
+    return ready;
+  }
+
+  boolean append(int num) {
+    char t[6];
+    sprintf(t, "%d", num);
+    return append(t);
+  }
+
+
 	int length() const {
 		return p;
 	}
@@ -100,6 +156,19 @@ public:
 	int getDebugCommandLength() const {
 		return ((length() >= 5) && (strncmp("DEBUG", buffer, 5) == 0)) ? 5 : 0;
 	}
+
+  // allow insert of whole command
+  void setCommand(char *b, int len){
+    memcpy(buffer, b, len);
+    p = len;
+    ready = true;
+  }
+
+  char *get(){
+    buffer[p] = 0;
+    return buffer;
+  }
+  
 private:
 	int p;
 	boolean ready;
@@ -107,6 +176,7 @@ private:
 };
 
 CommandBuffer command;
+CommandBuffer response;
 
 class CommandProcessor {
 private:	
@@ -128,18 +198,18 @@ public:
 			sendError("Whitespace required after DEBUG command");
 			return false;
 		}
-		switch (getChar()) {
-		case 'C':
+		switch (getChar() | 0x20) {
+		case 'c':
 			return processConfigCommand();
-		case 'D':
+		case 'd':
 			return processDigitalCommand();
-		case 'P':
+		case 'p':
 			return processPWMCommand();
-		case 'A':
+		case 'a':
 			return processAnalogCommand();
-		case 'N':
+		case 'n':
 			return processNameCommand();
-		case 'F':
+		case 'f':
 			return processFirmwareCommand();
 		default:
 			return processUnknownCommand();
@@ -171,7 +241,7 @@ protected:
 	
 	boolean skipSpacesAndP() {
 		skipSpaces();
-		return (getChar() == 'P');
+		return (getChar()|0x20 == 'p');
 	}
 
 	char getAfterSpace() {
@@ -233,28 +303,29 @@ protected:
 			//Serial.println(); // ESP8266 doesn't like it too (infinite loop)
 			return;
 		}
-		Serial.print("ERROR at ");
+    response.append("ERROR at ");
 		if(!message) {
-			Serial.println(p);
+      response.append("\r\n");
 		} else {
-			Serial.print(p);
-			Serial.print(": ");
-			Serial.println(message);
+			response.append(p);
+			response.append(": ");
+      response.append(message);
+      response.append("\r\n");
 		}
 	}
 
 	void sendOkPart() {
-		Serial.print("OK ");
+		response.append("OK ");
 	}	
 
 	boolean processConfigCommand() {
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'S':
-		case 'E':
+		case 's':
+		case 'e':
 			if(!parsePin()) return false;
-			return processConfigSetCommand(c == 'E');
-		case 'G':
+			return processConfigSetCommand(c == 'e');
+		case 'g':
 			if(!parsePin()) return false;
 			return processConfigGetCommand();
 		default:
@@ -267,8 +338,8 @@ protected:
 		byte config = PIN_CONFIG;
 		int state = 0;
 		char c;
-		switch(getAfterSpace()) {
-		case 'I': // Pin is configured to be INPUT
+		switch(getAfterSpace() | 0x20) {
+		case 'i': // Pin is configured to be INPUT
 			config |= PIN_DIGITAL_INPUT;
 			c = getChar();
 			if(c == '1') { // Turn on pullup resistor
@@ -279,12 +350,12 @@ protected:
 			}
 			state = digitalRead(pin);
 			break;
-		case 'O': // Pin is configured to be OUTPUT
-			c = getChar();
+		case 'o': // Pin is configured to be OUTPUT
+			c = getChar() | 0x20;
 			pinMode(pin, OUTPUT);
-			if(c == 'D') {
+			if(c == 'd') {
 				config |= PIN_DIGITAL_OUTPUT;
-			} else if(c = 'P') {
+			} else if(c = 'p') {
 				config |= PIN_PWM_OUTPUT;
 				if(!assertPWM()) return false;
 			} else {
@@ -311,30 +382,30 @@ protected:
 		sendOkPart();
 		if(config & PIN_CONFIG) {
 			if(config & PIN_DIGITAL_INPUT) {
-				Serial.print("I");
+				response.append("I");
 				if(config & PIN_DIGITAL_INPUT_PULLUP) {
-					Serial.print('1');
+					response.append('1');
 				} else {
-					Serial.print('0');
+					response.append('0');
 				}
 			} else if(config & PIN_PWM_OUTPUT) {
-				Serial.print("OP");
+				response.append("OP");
 			} else if(config & PIN_DIGITAL_OUTPUT) {
-				Serial.print("OD");
+				response.append("OD");
 			}
 		}
-		Serial.println();
+		response.append("\r\n");
 		return true;
 	}
 
 	boolean processDigitalCommand() {
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'S':
-		case 'E':
+		case 's':
+		case 'e':
 			if(!parsePin()) return false;
-			return processDigitalSetCommand(c == 'E');
-		case 'G':
+			return processDigitalSetCommand(c == 'e');
+		case 'g':
 			if(!parsePin()) return false;
 			return processDigitalGetCommand();
 		default:
@@ -344,8 +415,8 @@ protected:
 	}
 
 	boolean processDigitalSetCommand(boolean saveToEEPROM) {
-		char c = getAfterSpace();
-		if(c != 'V') {
+		char c = getAfterSpace() | 0x20;
+		if(c != 'v') {
 			sendError("Digital value to set not specified");
 			return false;
 		}
@@ -369,7 +440,7 @@ protected:
 	boolean processDigitalGetCommand() {
 		byte config = digitalConfig[pin];
 		sendOkPart();
-		Serial.print("V");
+		response.append("V");
 		int state = 0;
 		if(config & PIN_CONFIG) {
 			if(config & PIN_DIGITAL_INPUT) {
@@ -382,19 +453,20 @@ protected:
 			state = digitalRead(pin);
 			digitalState[pin] = state;
 		}
-		Serial.println(state);
+		response.append(state);
+    response.append("\r\n");
 		return true;
 	}
 
 	boolean processPWMCommand() {
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'S':
-		case 'E':
+		case 's':
+		case 'e':
 			if(!parsePin()) return false;
 			if(!assertPWM()) return false;
-			return processPWMSetCommand(c == 'E');
-		case 'G':
+			return processPWMSetCommand(c == 'e');
+		case 'g':
 			if(!parsePin()) return false;
 			return processDigitalGetCommand();
 		default:
@@ -404,8 +476,8 @@ protected:
 	}
 
 	boolean processPWMSetCommand(boolean saveToEEPROM) {
-		char c = getAfterSpace();
-		if(c != 'V') {
+		char c = getAfterSpace() | 0x20;
+		if(c != 'v') {
 			sendError("PWM value to set not specified");
 			return false;
 		}
@@ -425,8 +497,8 @@ protected:
 	}
 
 	boolean processAnalogCommand() {
-		char c = getChar();
-		if(c != 'G') {
+		char c = getChar() | 0x20;
+		if(c != 'g') {
 			sendError("Unknown Analog command");
 			return false;
 		}
@@ -436,17 +508,18 @@ protected:
 		}
 		int state = analogRead(pin);
 		sendOkPart();
-		Serial.print("V");
-		Serial.println(state);
+		response.append("V");
+		response.append(state);
+    response.append("\r\n");
 	}
 
 	boolean processNameCommand() {
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'S':
-		case 'E':
+		case 's':
+		case 'e':
 			return processNameSetCommand();
-		case 'G':
+		case 'g':
 			return processNameGetCommand();
 		default:
 			sendError("Unknown Name command");
@@ -457,10 +530,14 @@ protected:
 	boolean processNameSetCommand() {
 		skipSpaces();
 		int addr = DEVICE_NAME_ADDR;
-		for(char c = getChar(); addr < DEVICE_NAME_ADDR_END && c != '\0' && c != '\n' ; c = getChar(), ++addr) {
+		for(char c = getChar(); addr < DEVICE_NAME_ADDR_END && c != '\0' && c != '\n'  && c != '\r' ; c = getChar(), ++addr) {
 			saveChar(addr, c);
 		}
 		if(addr < DEVICE_NAME_ADDR_END) saveChar(addr, '\0');
+
+    // reload 1wire address
+    loadOneWire();
+   
 		return processNameGetCommand();
 	}
 
@@ -468,18 +545,18 @@ protected:
 		sendOkPart();
 		int addr = DEVICE_NAME_ADDR;
 		for(char c = loadChar(addr); addr < DEVICE_NAME_ADDR_END && c != '\0'; c = loadChar(++addr)) {
-			Serial.print(c);
+			response.append(c);
 		}
-		Serial.println();
+		response.append("\r\n");
 	}
 
 	boolean processFirmwareCommand() {
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'S':
-		case 'E':
+		case 's':
+		case 'e':
 			return processFirmwareSetCommand();
-		case 'G':
+		case 'g':
 			return processFirmwareGetCommand();
 		default:
 			sendError("Unknown Firmware command");
@@ -490,40 +567,40 @@ protected:
 	boolean processFirmwareGetCommand() {
 		skipSpaces();
 		sendOkPart();
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'V':
-			Serial.print(FIRMWARE_VERSION);
+		case 'v':
+			response.append(FIRMWARE_VERSION);
 			break;
-		case 'N':
-			Serial.print(FIRMWARE_NAME);
+		case 'n':
+			response.append(FIRMWARE_NAME);
 			break;
 		default:
-			Serial.print(FIRMWARE_NAME);
-			Serial.print(' ');
-			Serial.print(FIRMWARE_VERSION);
+			response.append(FIRMWARE_NAME);
+			response.append(' ');
+			response.append(FIRMWARE_VERSION);
 		}
-		Serial.println();
+		response.append("\r\n");
 		return true;
 	}
 
 	boolean processFirmwareSetCommand() {
 		skipSpaces();
-		char c = getChar();
+		char c = getChar() | 0x20;
 		switch(c) {
-		case 'A':
+		case 'a':
 			sendOkPart();
 			initEEPROM();
-			Serial.println("All configuration reset");
+			response.append("All configuration reset\n");
 			break;
-		case 'P':
+		case 'p':
 			sendOkPart();
 			initConfigEEPROM();
-			Serial.println("Pin configuration reset");
+			response.append("Pin configuration reset\n");
 			break;
-		case 'R':
+		case 'r':
 			sendOkPart();
-			Serial.println("Restart");
+			response.append("Restart\n");
 			break;
 		default:
 			sendError("Unknown Firmware command");
@@ -554,7 +631,9 @@ void initEEPROM() {
 	for(int i = ID_ADDR + 3; i < CONFIG_DIGITAL_ADDR; ++i) {
 		EEPROM.write(i, 0x00);
 	}
+
 	initConfigEEPROM();
+  initOneWireEEPROM();
 }
 
 void initConfigEEPROM() {
@@ -569,9 +648,14 @@ void initConfigEEPROM() {
 	}
 }
 
+void initOneWireEEPROM(){
+  loadOneWire();
+}
+
 void loadEEPROM() {
 	serialTrace("Using data from EEPROM");
 	loadPinConfig();
+  loadOneWire();
 }
 
 void resetState() {
@@ -608,6 +692,20 @@ void loadPinConfig() {
 	}
 }
 
+
+void loadOneWire(){
+  owROM[0] = 0xF0;
+  // use name for 1wire address
+  for(int i = DEVICE_NAME_ADDR; i < DEVICE_NAME_ADDR+6; ++i) {
+    byte b = EEPROM.read(i);
+    owROM[i-DEVICE_NAME_ADDR+1] = b;
+  }
+
+  // reset the 1-wire slave with new address  
+  OWSlave.begin(owROM, oneWireData.getPinNumber()); 
+}
+
+
 int loadInt(int addr) {
 	byte hiByte = EEPROM.read(addr);
 	byte lowByte = EEPROM.read(addr+1);
@@ -629,34 +727,137 @@ void saveChar(int addr, char value) {
 	EEPROM.write(addr, (byte) value);
 }
 
+
+volatile unsigned long conversionStartTime = 0;
+
+// This function will be called each time the OneWire library has an event to notify (reset, error, byte received)
+void owReceive(OneWireSlave::ReceiveEvent evt, byte data);
+
+
 void setup() {
+  //memset(scratchpad, 0, sizeof(scratchpad));
+  memset(scratchpadin, 0, sizeof(scratchpadin));
 	Serial.begin(115200);
-	if(checkEEPROM()) {
+
+	// Setup the OneWire library
+  OWSlave.setReceiveCallback(&owReceive);
+  
+  if(checkEEPROM()) {
 		loadEEPROM();
 	} else {
 		initEEPROM();
 	}
+
+  // Setup the OneWire library
+  OWSlave.begin(owROM, oneWireData.getPinNumber()); 
 }
+
 
 void loop() {
 	if(command.isReady()) {
+    //Serial.print("\r\ngot\r\n");
+    //Serial.print(command.get());
 		CommandProcessor processor(command);
 		processor.process();
 		command.clean();
+
+    // there should be a response ready.
+    // put in scratchpad for onewire collection, and send to serial anyway.
+    if(response.isReady()) 
+    {
+      char *t = response.get();
+      // copy up until first cr/lf/nul
+      for (char i = 0; i < sizeof(scratchpad); i++){
+        if (t[i] < 0x20){
+          scratchpad[i] = 0;
+          scratchposn = i+1;
+          break;
+        } else {
+          scratchpad[i] = t[i];
+          scratchposn = i+1;
+        }
+      }
+      Serial.print(t);
+      response.clean();
+    }
 	}
+
 }
 
 void serialEvent() {
 	while(Serial.available()) {
-		if(command.append((char)Serial.read())) {
-			if(Serial.available() && (((char)Serial.peek()) == '\n')) {
-				// Workaround for esp8266 sending welcome gibberish on start.
-				// Side effect of the workaround - if "\n\n" happened
-				// after entering command, the command is ignored.
-				Serial.read();
-				command.clean();
+    char c = (char)Serial.read();
+    // temp echo
+    //Serial.print(c);
+    
+		if(command.append(c)) {
+			if(Serial.available()){
+        char n = (char)Serial.peek();
+			
+			  if ((n == '\r') || (n == '\n')) {
+			
+  				// Workaround for esp8266 sending welcome gibberish on start.
+  				// Side effect of the workaround - if "\n\n" happened
+  				// after entering command, the command is ignored.
+  				Serial.read();
+  				command.clean();
+  			}
 			}
 			break;
 		}
 	}
 }
+
+void owReceive(OneWireSlave::ReceiveEvent evt, byte data)
+{
+  switch (evt)
+  {
+  case OneWireSlave::RE_Byte:
+    switch (state)
+    {
+    case DS_WaitingData:
+      if (scratchinposn < sizeof(scratchpadin)){
+        scratchpadin[scratchinposn] = data;
+        scratchinposn++;
+        if (data < 0x20){
+          command.setCommand(scratchpadin, scratchinposn);
+          scratchinposn = 0;
+        }
+      }
+      break;
+    case DS_WaitingCommand:
+      switch (data)
+      {
+      case DS18B20_START_CONVERSION:
+        Serial.print('c');
+        //state = DS_ConvertingTemperature;
+        //conversionStartTime = millis();
+        //OWSlave.beginWriteBit(0, true); // send zeros as long as the conversion is not finished
+        break;
+
+      case DS18B20_READ_SCRATCHPAD:
+        Serial.print('r');
+        state = DS_WaitingReset;
+        OWSlave.beginWrite((const byte*)scratchpad, strlen(scratchpad)+1, 0);
+        break;
+
+      case DS18B20_WRITE_SCRATCHPAD:
+        Serial.print('w');
+        scratchinposn = 0;
+        state = DS_WaitingData;
+        break;
+      }
+      break;
+    }
+    break;
+
+  case OneWireSlave::RE_Reset:
+    state = DS_WaitingCommand;
+    break;
+
+  case OneWireSlave::RE_Error:
+    state = DS_WaitingReset;
+    break;
+  }
+}
+
