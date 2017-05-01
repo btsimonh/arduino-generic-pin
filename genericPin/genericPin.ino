@@ -408,6 +408,8 @@ protected:
 		case 'g':
 			if(!parsePin()) return false;
 			return processDigitalGetCommand();
+    case 'a': // get all pins input values
+      return processDigitalGetAll();
 		default:
 			sendError("Unknown Digital command");
 			return false;
@@ -436,6 +438,18 @@ protected:
 		}
 		return processDigitalGetCommand();
 	}
+
+
+  boolean processDigitalGetAll(){
+    sendOkPart();
+    response.append("A");
+    char t[10];
+    sprintf(t, "%02.2X%02.2X%02.2X",
+      PIND, PINB, PINC);
+    response.append(t);
+    response.append("\r\n");
+    return true;
+  }
 
 	boolean processDigitalGetCommand() {
 		byte config = digitalConfig[pin];
