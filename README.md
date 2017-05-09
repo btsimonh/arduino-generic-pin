@@ -1,9 +1,11 @@
 # Arduino GenericPin 1.0.0
 Provides a serial interface to configure, control, and request Arduino pins state with commands.
+Provides a 1-wire client interface carrying the same serial interface (pin 2)
 
 ## Features
 * Digital, Analog and PWM pins are supported
 * Pin configuration and initial state can be stored in EEPROM to survive reboots
+* DHT11 read on pin 3, initialised on first aquire command
 
 ## Usage
 1. Upload [genericPin.ino](genericPin/genericPin.ino) to Arduino board with [Arduino IDE](https://www.arduino.cc/en/Main/Software).
@@ -18,6 +20,9 @@ Command|Description
 `CE P9 OP`|Configure 9th digital pin for PWM output and store the configuration in EEPROM to survive reboots.
 `PG P9`|Get the PWM value of 9th digital pin.
 `AG P7`|Get the value of 7th analog pin.
+'HA'|Start DHT11 acquire.
+'HG'|Read DHT11 result.
+
 
 ### Flashing and smoke testing animation:
 [![Arduino GenericPin Flash & Smoke Test](https://github.com/dev-lab/blob/blob/master/iot-power-strip/flash-n-test-pic.png)](https://github.com/dev-lab/blob/blob/master/iot-power-strip/flash-n-test.gif)
@@ -210,6 +215,23 @@ Command|Description
 Command|Description
 ---|---
 `FG V`|Return the firmware version, e.g. `OK 1.0.0`
+
+### DHT11 commands
+
+Command|Description
+---|---
+'HA'|Start Acquisition of DHT11 data.  Data is read via interrupt.
+'HG'|Get DHT11 response data - returns 'OK h t d' where h= humidity per thousand, t=temp C, d=dewpoint.
+Note: 'HG' can return: 
+    OK ECS- checksum error
+    OK ETOI - ISR timeout
+    OK ETOR - Response timeout
+    OK ETOD - data timeout
+    OK EA - still acquiring
+    OK ED - error delta
+    OK ES - error not started
+    OK ERR - unknown error
+
 
 ## Notes:
 * Nothing will be returned as a response to an invalid command by default. That is a workaround for ESP8266 sending some gibberish to UART on (re)start.

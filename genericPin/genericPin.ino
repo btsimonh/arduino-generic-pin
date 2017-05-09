@@ -2,6 +2,19 @@
 #include "LowLevel.h"
 #include "OneWireSlave.h"
 #include <EEPROM.h>
+#include "idDHT11.h"
+
+
+#define idDHT11pin 3        //Digital pin for comunications
+#define idDHT11intNumber 1  //interrupt number (must be the one that use the previus defined pin (see table above)
+
+//declaration
+void dht11_wrapper(); // must be declared before the lib initialization
+
+// Lib instantiate
+idDHT11 DHT11(idDHT11pin,idDHT11intNumber,dht11_wrapper);
+
+
 //#define SERIAL_TRACE // Comment to disable trace to serial port
 
 #if defined SERIAL_TRACE
@@ -69,8 +82,8 @@ void wdt_init(void)
  	return;
 }
 
-char *FIRMWARE_VERSION = "1.0.0";
-char *FIRMWARE_NAME = "GenericPin1Wire";
+const char *FIRMWARE_VERSION = "1.0.0";
+const char *FIRMWARE_NAME = "GenericPin1Wire";
 
 // these values are saved in EEPROM
 const byte EEPROM_ID1 = 'G'; // used to identify if valid data in EEPROM
@@ -109,7 +122,7 @@ class CommandBuffer {
 public:
 	CommandBuffer() : p(0), ready(false) {
 	}
-	boolean append(char c) {
+	boolean append(const char c) {
 		if((c == '\n') || (c == '\r')) {
 			ready = true;
 		} else if(p < MAX_COMMAND_LEN) {
@@ -120,7 +133,7 @@ public:
 		return ready;
 	}
 
-	boolean append(char *str) {
+	boolean append(const char *str) {
     int l = strlen(str);
     for (int i = 0; i < l; i++){
       char c = str[i];
@@ -211,6 +224,8 @@ public:
 			return processNameCommand();
 		case 'f':
 			return processFirmwareCommand();
+    case 'h':
+      return processDHTCommand();
 		default:
 			return processUnknownCommand();
 		}
@@ -298,7 +313,7 @@ protected:
 		return value;
 	}
 
-	void sendError(char* message) {
+	void sendError(const char* message) {
 		if(!debug) {
 			//Serial.println(); // ESP8266 doesn't like it too (infinite loop)
 			return;
@@ -526,6 +541,66 @@ protected:
 		response.append(state);
     response.append("\r\n");
 	}
+
+  boolean processDHTCommand() {
+    char c = getChar() | 0x20;
+    if(c == 'a') {
+      DHT11.acquire();
+      sendOkPart();
+      response.append("\r\n");
+      return true;
+    }
+    
+    if(c == 'g') {
+      char res = DHT11.getStatus();
+      sendOkPart();
+      switch(res){
+        case IDDHTLIB_READ: 
+          response.append("R");
+        case IDDHTLIB_OK: 
+          {
+          float h, t, d;
+          h = DHT11.getHumidity();
+          t = DHT11.getCelsius();
+          d = DHT11.getDewPoint();
+          char tmp[20];
+          sprintf(tmp, "%d %d %d",
+            (int)h*10, (int)t*10, (int)d*10); 
+          response.append(tmp);
+          DHT11.setread();
+          }
+          break;
+        case IDDHTLIB_ERROR_CHECKSUM: 
+          response.append("ECS");
+          break;
+        case IDDHTLIB_ERROR_ISR_TIMEOUT: 
+          response.append("ETOI");
+          break;
+        case IDDHTLIB_ERROR_RESPONSE_TIMEOUT: 
+          response.append("ETOR");
+          break;
+        case IDDHTLIB_ERROR_DATA_TIMEOUT: 
+          response.append("ETOD");
+          break;
+        case IDDHTLIB_ERROR_ACQUIRING: 
+          response.append("EA");
+          break;
+        case IDDHTLIB_ERROR_DELTA: 
+          response.append("ED");
+          break;
+        case IDDHTLIB_ERROR_NOTSTARTED: 
+          response.append("ES");
+          break;
+        default: 
+          response.append("ERR");
+          break;
+      }
+      response.append("\r\n");
+      return true;
+    }
+    sendError("Unknown DHT command");
+    return false;
+  }
 
 	boolean processNameCommand() {
 		char c = getChar() | 0x20;
@@ -764,6 +839,13 @@ void setup() {
 
   // Setup the OneWire library
   OWSlave.begin(owROM, oneWireData.getPinNumber()); 
+
+
+  
+}
+
+void dht11_wrapper() {
+  DHT11.isrCallback();
 }
 
 
